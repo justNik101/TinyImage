@@ -1,0 +1,5 @@
+{
+  "name": "TinyPic: Client-Side Image Reducer",
+  "description": "A privacy-focused image compressor that reduces file size to your target KB entirely in your browser.",
+  "requestFramePermissions": []
+}
