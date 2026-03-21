@@ -4,8 +4,14 @@
  */
 
 import React, { useState, useRef, useCallback } from 'react';
-import { Upload, Download, Image as ImageIcon, X, Loader2, ArrowRight, Settings2, Info } from 'lucide-react';
+import { Upload, Download, Image as ImageIcon, X, Loader2, ArrowRight, Settings2, Info, Scan } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+
+declare global {
+  interface Window {
+    cv: any;
+  }
+}
 
 interface ImageStats {
   originalSize: number;
@@ -22,7 +28,26 @@ export default function App() {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [compressedUrl, setCompressedUrl] = useState<string | null>(null);
   const [targetSizeKB, setTargetSizeKB] = useState<number>(100);
+  const [isScanMode, setIsScanMode] = useState(false);
+  const [scanSettings, setScanSettings] = useState({
+    noise: 15,
+    tilt: 0.5,
+    blur: 0.3,
+    bw: true
+  });
+  const [isOpenCVReady, setIsOpenCVReady] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+
+  // Check if OpenCV is ready
+  React.useEffect(() => {
+    const checkOpenCV = setInterval(() => {
+      if (window.cv && window.cv.imread) {
+        setIsOpenCVReady(true);
+        clearInterval(checkOpenCV);
+      }
+    }, 100);
+    return () => clearInterval(checkOpenCV);
+  }, []);
   const [stats, setStats] = useState<ImageStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   
@@ -64,6 +89,77 @@ export default function App() {
         img.onerror = reject;
       });
 
+      // --- PHASE 1: SCANNING (Only if Scan Mode is enabled) ---
+      let sourceElement: HTMLImageElement | HTMLCanvasElement = img;
+      
+      if (isScanMode) {
+        const scanCanvas = document.createElement('canvas');
+        scanCanvas.width = img.width;
+        scanCanvas.height = img.height;
+        const scanCtx = scanCanvas.getContext('2d')!;
+        
+        // 1. Background Fill (White)
+        scanCtx.fillStyle = 'white';
+        scanCtx.fillRect(0, 0, scanCanvas.width, scanCanvas.height);
+
+        // 2. Slight Tilt (Inspired by lookscanned.io)
+        const tilt = (Math.random() - 0.5) * (scanSettings.tilt * 2);
+        scanCtx.save();
+        scanCtx.translate(scanCanvas.width / 2, scanCanvas.height / 2);
+        scanCtx.rotate((tilt * Math.PI) / 180);
+        
+        // 3. Draw Image with Filters
+        scanCtx.filter = `grayscale(${scanSettings.bw ? 1 : 0}) contrast(1.2) brightness(1.05) blur(${scanSettings.blur}px)`;
+        scanCtx.drawImage(img, -scanCanvas.width / 2, -scanCanvas.height / 2, scanCanvas.width, scanCanvas.height);
+        scanCtx.restore();
+
+        // 4. Add Noise/Grain (Inspired by lookscanned.io)
+        const imageData = scanCtx.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
+        const data = imageData.data;
+        for (let i = 0; i < data.length; i += 4) {
+          const noise = (Math.random() - 0.5) * scanSettings.noise;
+          data[i] = Math.min(255, Math.max(0, data[i] + noise));
+          data[i + 1] = Math.min(255, Math.max(0, data[i + 1] + noise));
+          data[i + 2] = Math.min(255, Math.max(0, data[i + 2] + noise));
+        }
+        scanCtx.putImageData(imageData, 0, 0);
+
+        // 5. Optional: Adaptive Thresholding (If B&W is enabled and OpenCV is ready)
+        if (scanSettings.bw && isOpenCVReady) {
+          try {
+            const cv = window.cv;
+            let src = cv.imread(scanCanvas);
+            let dst = new cv.Mat();
+            
+            // Convert to grayscale
+            cv.cvtColor(src, src, cv.COLOR_RGBA2GRAY, 0);
+            
+            // Add a slight blur to help merge edges into solid strokes (fixes "hollow" signatures)
+            cv.GaussianBlur(src, src, new cv.Size(3, 3), 0);
+            
+            // Increase block size (from 15 to 41) to capture solid areas rather than just borders
+            // C value (10) helps remove background noise
+            cv.adaptiveThreshold(
+              src, 
+              dst, 
+              255, 
+              cv.ADAPTIVE_THRESH_GAUSSIAN_C, 
+              cv.THRESH_BINARY, 
+              41, 
+              10
+            );
+            
+            cv.imshow(scanCanvas, dst);
+            src.delete(); dst.delete();
+          } catch (e) {
+            console.warn('OpenCV processing failed, falling back to basic filters', e);
+          }
+        }
+        
+        sourceElement = scanCanvas;
+      }
+
+      // --- PHASE 2: ITERATIVE COMPRESSION ---
       const targetSizeBytes = targetSizeKB * 1024;
       let quality = 0.9;
       let scale = 1.0;
@@ -74,65 +170,58 @@ export default function App() {
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = 'high';
 
-      // Iterative compression strategy
       let attempts = 0;
-      const maxAttempts = 30;
-      
-      // Initial check at high quality
-      canvas.width = img.width;
-      canvas.height = img.height;
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      compressedBlob = await new Promise<Blob | null>((resolve) => {
-        canvas.toBlob((blob) => resolve(blob), 'image/jpeg', quality);
-      });
+      const maxAttempts = 40;
+      let bestBlob: Blob | null = null;
+      let bestQuality = quality;
+      let bestScale = scale;
 
-      if (compressedBlob && compressedBlob.size > targetSizeBytes) {
-        while (attempts < maxAttempts) {
-          const sizeRatio = compressedBlob.size / targetSizeBytes;
-          
-          if (sizeRatio <= 1.0) break;
+      while (attempts < maxAttempts) {
+        const currentWidth = Math.max(1, sourceElement.width * scale);
+        const currentHeight = Math.max(1, sourceElement.height * scale);
+        canvas.width = currentWidth;
+        canvas.height = currentHeight;
+        
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(sourceElement, 0, 0, canvas.width, canvas.height);
 
-          // Strategy: 
-          // 1. Reduce quality down to 0.1 first
-          // 2. Then start reducing scale
-          
-          if (quality > 0.1) {
-            // Reduce quality gradually
-            quality -= Math.max(0.05, (quality - 0.1) * 0.3);
-            if (quality < 0.1) quality = 0.1;
-          } else {
-            // Quality is at minimum, now reduce scale
-            // Use a more conservative scaling factor to avoid excessive blurring
-            scale *= Math.max(0.7, 1 / Math.sqrt(sizeRatio));
-          }
+        compressedBlob = await new Promise<Blob | null>((resolve) => {
+          canvas.toBlob((blob) => resolve(blob), 'image/jpeg', quality);
+        });
 
-          scale = Math.max(scale, 0.05); // Don't go below 5% of original size
+        if (!compressedBlob) break;
 
-          canvas.width = Math.max(1, img.width * scale);
-          canvas.height = Math.max(1, img.height * scale);
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
-          ctx.imageSmoothingQuality = 'high';
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
-          compressedBlob = await new Promise<Blob | null>((resolve) => {
-            canvas.toBlob((blob) => resolve(blob), 'image/jpeg', quality);
-          });
-
-          if (!compressedBlob) break;
-          attempts++;
+        if (compressedBlob.size <= targetSizeBytes) {
+          bestBlob = compressedBlob;
+          bestQuality = quality;
+          bestScale = scale;
+          if (compressedBlob.size > targetSizeBytes * 0.9) break;
+          break;
         }
+
+        if (quality > 0.3) {
+          quality -= 0.1;
+        } else {
+          scale *= 0.85;
+          quality = 0.6;
+        }
+
+        if (scale < 0.05) break; 
+        attempts++;
       }
 
-      if (compressedBlob) {
-        setCompressedUrl(URL.createObjectURL(compressedBlob));
+      if (bestBlob || compressedBlob) {
+        const finalBlob = bestBlob || compressedBlob;
+        setCompressedUrl(URL.createObjectURL(finalBlob!));
         setStats({
           originalSize: selectedImage.size,
-          compressedSize: compressedBlob.size,
+          compressedSize: finalBlob!.size,
           originalWidth: img.width,
           originalHeight: img.height,
-          compressedWidth: canvas.width,
-          compressedHeight: canvas.height,
-          quality: Math.round(quality * 100)
+          compressedWidth: Math.round(sourceElement.width * (bestBlob ? bestScale : scale)),
+          compressedHeight: Math.round(sourceElement.height * (bestBlob ? bestScale : scale)),
+          quality: Math.round((bestBlob ? bestQuality : quality) * 100)
         });
       }
     } catch (err) {
@@ -200,6 +289,109 @@ export default function App() {
                     />
                     <span className="absolute right-4 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">KB</span>
                   </div>
+                </div>
+
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between p-4 bg-[#f9f9f9] rounded-2xl border border-black/5">
+                    <div className="flex items-center gap-3">
+                      <div className={`p-2 rounded-lg ${isScanMode ? 'bg-black text-white' : 'bg-white text-black/40'}`}>
+                        <Scan className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <p className="text-sm font-medium">Scan Mode</p>
+                        <p className="text-xs text-muted-foreground">
+                          {isOpenCVReady ? 'Look Scanned Effect' : 'Loading Scanner...'}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => setIsScanMode(!isScanMode)}
+                      disabled={!isOpenCVReady}
+                      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${
+                        isScanMode ? 'bg-black' : 'bg-black/10'
+                      } ${!isOpenCVReady ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                          isScanMode ? 'translate-x-6' : 'translate-x-1'
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  <AnimatePresence>
+                    {isScanMode && (
+                      <motion.div
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: 'auto', opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        className="overflow-hidden space-y-4 p-4 bg-[#f9f9f9] rounded-2xl border border-black/5"
+                      >
+                        <div className="space-y-2">
+                          <div className="flex justify-between text-xs">
+                            <span className="text-muted-foreground">Noise (Grain)</span>
+                            <span className="font-medium">{scanSettings.noise}</span>
+                          </div>
+                          <input
+                            type="range"
+                            min="0"
+                            max="50"
+                            value={scanSettings.noise}
+                            onChange={(e) => setScanSettings({ ...scanSettings, noise: parseInt(e.target.value) })}
+                            className="w-full h-1.5 bg-black/10 rounded-lg appearance-none cursor-pointer accent-black"
+                          />
+                        </div>
+
+                        <div className="space-y-2">
+                          <div className="flex justify-between text-xs">
+                            <span className="text-muted-foreground">Tilt (Rotation)</span>
+                            <span className="font-medium">{scanSettings.tilt}°</span>
+                          </div>
+                          <input
+                            type="range"
+                            min="0"
+                            max="5"
+                            step="0.1"
+                            value={scanSettings.tilt}
+                            onChange={(e) => setScanSettings({ ...scanSettings, tilt: parseFloat(e.target.value) })}
+                            className="w-full h-1.5 bg-black/10 rounded-lg appearance-none cursor-pointer accent-black"
+                          />
+                        </div>
+
+                        <div className="space-y-2">
+                          <div className="flex justify-between text-xs">
+                            <span className="text-muted-foreground">Blur (Focus)</span>
+                            <span className="font-medium">{scanSettings.blur}px</span>
+                          </div>
+                          <input
+                            type="range"
+                            min="0"
+                            max="2"
+                            step="0.1"
+                            value={scanSettings.blur}
+                            onChange={(e) => setScanSettings({ ...scanSettings, blur: parseFloat(e.target.value) })}
+                            className="w-full h-1.5 bg-black/10 rounded-lg appearance-none cursor-pointer accent-black"
+                          />
+                        </div>
+
+                        <div className="flex items-center justify-between pt-2 border-t border-black/5">
+                          <span className="text-xs text-muted-foreground font-medium">Black & White</span>
+                          <button
+                            onClick={() => setScanSettings({ ...scanSettings, bw: !scanSettings.bw })}
+                            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none ${
+                              scanSettings.bw ? 'bg-black' : 'bg-black/10'
+                            }`}
+                          >
+                            <span
+                              className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
+                                scanSettings.bw ? 'translate-x-5' : 'translate-x-1'
+                              }`}
+                            />
+                          </button>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
                 </div>
 
                 <button
