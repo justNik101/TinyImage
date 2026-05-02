@@ -7,3 +7,4 @@ https://justnik101.github.io/TinyImage/
 used google ai studio to build this pure FE app 
 then took suggestions from claude code for fixing GitHub pages issue
 
+this app is created mainly for compressing image and generating the scanned copy
