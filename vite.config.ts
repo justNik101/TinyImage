@@ -5,8 +5,9 @@ import {defineConfig, loadEnv} from 'vite';
 
 export default defineConfig(({mode}) => {
   const env = loadEnv(mode, '.', '');
+  const base = process.env.VITE_BASE ?? './';
   return {
-    base: '/TinyImage/',
+    base: base,
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
